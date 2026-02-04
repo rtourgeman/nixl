@@ -99,7 +99,6 @@ nixl_ep_cuda_args = [
     '-Xcompiler', '-Wno-sign-compare',
     '-Xcompiler', '-Wno-reorder',
     '-Xcompiler', '-Wno-attributes',
-    '-DENABLE_FAST_DEBUG=1',
 ]
 
 # NVCC 12.9 workaround for bug (https://nvbugspro.nvidia.com/bug/5595631)
@@ -120,6 +119,12 @@ nixl_ep_override_options = []
 if get_option('buildtype') == 'debug'
     nixl_ep_override_options = ['optimization=3']
     nixl_ep_cpp_args += ['-g']
+endif
+
+enable_fast_debug = get_option('buildtype') == 'debug'
+
+if enable_fast_debug
+    nixl_ep_cuda_args += ['-DENABLE_FAST_DEBUG']
 endif
 
 nixl_ep_install_rpath = join_paths(get_option('prefix'), get_option('libdir'))
