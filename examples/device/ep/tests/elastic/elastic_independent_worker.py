@@ -111,8 +111,54 @@ def main():
     remote_ranks = set()
     mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
 
-    # Import test_main from elastic.py
-    from elastic import test_main
+    import random
+
+    def split_send_recv_stress_test(buffer, num_tokens, hidden, num_experts,
+                                    num_topk, rank, num_ranks, num_iters=50):
+        """Stress test using split SEND_ONLY dispatch/combine with deferred
+        recv hooks. Reproduces RDMA delivery failure after memory view rebuild
+        when ranks run as independent processes."""
+        num_local_experts = num_experts // num_ranks
+        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs() + 1
+        topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
+        topk_idx = topk_idx.to(nixl_ep.topk_idx_t)
+        topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device="cuda").abs()
+
+        for i in range(num_iters):
+            # --- Dispatch with SEND_ONLY (return_recv_hook=True) ---
+            packed_recv_x, packed_recv_count, handle, event, dispatch_hook = \
+                buffer.dispatch(
+                    x, topk_idx, num_tokens, num_experts,
+                    use_fp8=False, async_finish=False,
+                    return_recv_hook=True,
+                )
+
+            # --- Call the dispatch recv hook (deferred receive) ---
+            dispatch_hook()
+
+            # --- Simulate expert computation (GPU work between dispatch and combine) ---
+            simulated_expert_output = packed_recv_x.clone() if isinstance(packed_recv_x, torch.Tensor) else packed_recv_x[0].clone()
+
+            # --- Combine with SEND_ONLY (return_recv_hook=True) ---
+            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            combined_x, event, combine_hook = buffer.combine(
+                simulated_expert_output, topk_idx, topk_weights, handle,
+                async_finish=False, zero_copy=False,
+                return_recv_hook=True, out=out,
+            )
+
+            # --- Call the combine recv hook (deferred receive) ---
+            combine_hook()
+
+        # Check mask state
+        mask_check = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
+        buffer.query_mask_buffer(mask_check)
+        torch.cuda.synchronize()
+        masked = [r for r in range(num_ranks) if mask_check[r].item() != 0]
+        if masked:
+            print(f"[PID {os.getpid()}] rank={rank} WARNING: masked ranks after warmup: {masked}", flush=True)
+        return len(masked) == 0
 
     while True:
         print(
@@ -153,22 +199,16 @@ def main():
         current_num_ranks = max(active_ranks_list) + 1
         current_num_experts = args.num_experts_per_rank * current_num_ranks
 
-        num_stress_iters = 50
-        for stress_iter in range(num_stress_iters):
-            test_main(
-                args.num_tokens,
-                args.hidden_dim,
-                current_num_experts,
-                args.num_topk,
-                global_rank,
-                current_num_ranks,
-                max_num_ranks,
-                buffer,
-                kineto=args.kineto,
-            )
+        # Run vLLM-like warmup with split SEND_ONLY + deferred recv hooks
+        ok = split_send_recv_stress_test(
+            buffer, args.num_tokens, args.hidden_dim,
+            current_num_experts, args.num_topk,
+            global_rank, current_num_ranks,
+            num_iters=50,
+        )
         print(
             f"[PID {os.getpid()}] rank={global_rank} -> "
-            f"completed {num_stress_iters} stress iterations for phase {plan.get_phase()}",
+            f"phase {plan.get_phase()} vllm-like warmup: {'PASS' if ok else 'FAIL'}",
             flush=True,
         )
 
