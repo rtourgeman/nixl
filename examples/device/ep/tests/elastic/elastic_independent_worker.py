@@ -1,10 +1,33 @@
 #!/usr/bin/env python3
 """
-Single-rank worker for the independent-process elastic EP test.
-Launched by elastic_independent.py via subprocess.Popen.
+Standalone reproducer for NIXL-EP RDMA bug with elastic reconnect.
 
-This is functionally identical to the worker() function in elastic.py,
-but runs as a fully independent Python process.
+Reproduces a silent RDMA delivery failure (NEVER_RECEIVED) when:
+  1. RDMA transport is used (disable_ll_nvlink=True, no NVLink/P2P)
+  2. Split SEND_ONLY dispatch/combine mode (return_recv_hook=True)
+  3. Ranks run as independent processes (subprocess.Popen, not mp.spawn)
+  4. Memory views are rebuilt via a second connect_ranks() call
+
+The bug does NOT reproduce when any of the above conditions is removed:
+  - NVLink transport: always works
+  - Combined SEND+RECV mode (return_recv_hook=False): always works
+  - torch.multiprocessing.spawn processes: always works
+  - First connect_ranks (no prior views): always works
+
+Launch via elastic_independent.py:
+
+  RDMA (reproduces the bug):
+    python3 elastic_independent.py \
+        --disable-ll-nvlink \
+        --num-tokens 256 --hidden-dim 2048 \
+        --num-experts-per-rank 16 --num-topk 6 \
+        --plan double_expansion.json --num-processes 8
+
+  NVLink (should pass cleanly):
+    python3 elastic_independent.py \
+        --num-tokens 256 --hidden-dim 2048 \
+        --num-experts-per-rank 16 --num-topk 6 \
+        --plan double_expansion.json --num-processes 8
 """
 
 import argparse
@@ -20,7 +43,6 @@ import torch
 from plan import Plan
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import bench, calc_diff, hash_tensor, per_token_cast_back  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
@@ -36,6 +58,70 @@ def handle_sigterm(signum, frame, buffer, plan, rank_client):
         buffer.destroy()
         del buffer
     sys.exit(1)
+
+
+def split_send_recv_stress_test(
+    buffer, num_tokens, hidden, num_experts, num_topk,
+    rank, num_ranks, max_num_ranks, num_iters=50,
+):
+    """Run dispatch→combine using split SEND_ONLY mode (return_recv_hook=True).
+
+    This exercises the same execution pattern as vLLM's MoE all2all:
+      1. Dispatch SEND_ONLY kernel → deferred recv hook
+      2. Expert computation (simulated)
+      3. Combine SEND_ONLY kernel → deferred recv hook
+
+    After num_iters iterations, checks the mask buffer. If any ranks
+    are masked, RDMA delivery failed silently (the bug).
+
+    Returns True if all ranks are healthy, False if failures detected.
+    """
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    scores = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    ).abs() + 1
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
+    topk_idx = topk_idx.to(nixl_ep.topk_idx_t)
+    topk_weights = torch.randn(
+        (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+    ).abs()
+
+    for _ in range(num_iters):
+        # Dispatch: SEND_ONLY
+        packed_recv_x, _, handle, _, dispatch_hook = buffer.dispatch(
+            x, topk_idx, num_tokens, num_experts,
+            use_fp8=False, async_finish=False, return_recv_hook=True,
+        )
+        dispatch_hook()
+
+        # Simulated expert computation
+        expert_out = (
+            packed_recv_x.clone()
+            if isinstance(packed_recv_x, torch.Tensor)
+            else packed_recv_x[0].clone()
+        )
+
+        # Combine: SEND_ONLY
+        out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        _, _, combine_hook = buffer.combine(
+            expert_out, topk_idx, topk_weights, handle,
+            async_finish=False, zero_copy=False,
+            return_recv_hook=True, out=out,
+        )
+        combine_hook()
+
+    # Check for RDMA failures (auto-masked ranks)
+    mask = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
+    buffer.query_mask_buffer(mask)
+    torch.cuda.synchronize()
+    masked = [r for r in range(num_ranks) if mask[r].item() != 0]
+    if masked:
+        print(
+            f"[PID {os.getpid()}] rank={rank} FAIL: "
+            f"masked ranks (RDMA delivery failure): {masked}",
+            flush=True,
+        )
+    return len(masked) == 0
 
 
 def main():
@@ -61,16 +147,15 @@ def main():
     )
     if plan.current_phase == -1:
         print(
-            f"[PID {os.getpid()}] Process {args.torch_rank} -> "
-            f"no plan phases for rank {global_rank}, exiting",
+            f"[PID {os.getpid()}] rank {global_rank}: "
+            f"no phases found, exiting",
             flush=True,
         )
         return
 
     max_num_ranks = plan.get_max_rank() + 1
     print(
-        f"[PID {os.getpid()}] Process {args.torch_rank} -> "
-        f"global_rank={global_rank}, local_rank={local_rank}",
+        f"[PID {os.getpid()}] rank={global_rank}, local_rank={local_rank}",
         flush=True,
     )
 
@@ -80,22 +165,17 @@ def main():
     torch.cuda.set_device(0)
 
     tcp_store = store_group.create_client_store(
-        master_addr=server_addr,
-        port=TCP_STORE_PORT,
+        master_addr=server_addr, port=TCP_STORE_PORT,
     )
 
     num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
-        args.num_tokens,
-        args.hidden_dim,
-        max_num_ranks,
-        args.num_experts_per_rank * max_num_ranks,
+        args.num_tokens, args.hidden_dim,
+        max_num_ranks, args.num_experts_per_rank * max_num_ranks,
     )
-    if local_rank == 0:
-        print(f"Allocating buffer size: {num_rdma_bytes / 1e6} MB ...", flush=True)
 
     buffer = nixl_ep.Buffer(
         rank=global_rank,
-        disable_ll_nvlink=True,
+        disable_ll_nvlink=args.disable_ll_nvlink,
         explicitly_destroy=True,
         tcp_store_group=tcp_store,
     )
@@ -111,129 +191,49 @@ def main():
     remote_ranks = set()
     mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
 
-    import random
-
-    def split_send_recv_stress_test(buffer, num_tokens, hidden, num_experts,
-                                    num_topk, rank, num_ranks, num_iters=50):
-        """Stress test using split SEND_ONLY dispatch/combine with deferred
-        recv hooks. Reproduces RDMA delivery failure after memory view rebuild
-        when ranks run as independent processes."""
-        num_local_experts = num_experts // num_ranks
-        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs() + 1
-        topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
-        topk_idx = topk_idx.to(nixl_ep.topk_idx_t)
-        topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device="cuda").abs()
-
-        for i in range(num_iters):
-            # --- Dispatch with SEND_ONLY (return_recv_hook=True) ---
-            packed_recv_x, packed_recv_count, handle, event, dispatch_hook = \
-                buffer.dispatch(
-                    x, topk_idx, num_tokens, num_experts,
-                    use_fp8=False, async_finish=False,
-                    return_recv_hook=True,
-                )
-
-            # --- Call the dispatch recv hook (deferred receive) ---
-            dispatch_hook()
-
-            # --- Simulate expert computation (GPU work between dispatch and combine) ---
-            simulated_expert_output = packed_recv_x.clone() if isinstance(packed_recv_x, torch.Tensor) else packed_recv_x[0].clone()
-
-            # --- Combine with SEND_ONLY (return_recv_hook=True) ---
-            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-            combined_x, event, combine_hook = buffer.combine(
-                simulated_expert_output, topk_idx, topk_weights, handle,
-                async_finish=False, zero_copy=False,
-                return_recv_hook=True, out=out,
-            )
-
-            # --- Call the combine recv hook (deferred receive) ---
-            combine_hook()
-
-        # Check mask state
-        mask_check = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
-        buffer.query_mask_buffer(mask_check)
-        torch.cuda.synchronize()
-        masked = [r for r in range(num_ranks) if mask_check[r].item() != 0]
-        if masked:
-            print(f"[PID {os.getpid()}] rank={rank} WARNING: masked ranks after warmup: {masked}", flush=True)
-        return len(masked) == 0
-
     while True:
-        print(
-            f"[PID {os.getpid()}] rank={global_rank} -> "
-            f"start phase {plan.get_phase()}",
-            flush=True,
-        )
-
+        phase = plan.get_phase()
         added_ranks = plan.get_new_ranks()
         cleanly_removed = plan.get_removed_ranks()
 
         if global_rank in cleanly_removed:
-            print(f"[PID {os.getpid()}] rank={global_rank} -> removed, exiting", flush=True)
-            rank_client.release_rank(user_context=plan.get_phase())
+            rank_client.release_rank(user_context=phase)
             break
 
-        if len(added_ranks) > 0:
-            print(
-                f"[PID {os.getpid()}] rank={global_rank} -> "
-                f"adding connections to {added_ranks}",
-                flush=True,
-            )
+        if added_ranks:
+            print(f"[PID {os.getpid()}] rank={global_rank} phase {phase}: "
+                  f"connecting {added_ranks}", flush=True)
             buffer.connect_ranks(added_ranks)
             remote_ranks.update(added_ranks)
 
-        if len(cleanly_removed) > 0:
-            print(
-                f"[PID {os.getpid()}] rank={global_rank} -> "
-                f"removing connections to {cleanly_removed}",
-                flush=True,
-            )
+        if cleanly_removed:
             buffer.disconnect_ranks(cleanly_removed)
             remote_ranks.difference_update(cleanly_removed)
             import time
             time.sleep(5)
 
-        active_ranks_list = plan.get_active_ranks()
-        current_num_ranks = max(active_ranks_list) + 1
-        current_num_experts = args.num_experts_per_rank * current_num_ranks
+        active_ranks = plan.get_active_ranks()
+        num_ranks = max(active_ranks) + 1
+        num_experts = args.num_experts_per_rank * num_ranks
 
-        # Run vLLM-like warmup with split SEND_ONLY + deferred recv hooks
         ok = split_send_recv_stress_test(
             buffer, args.num_tokens, args.hidden_dim,
-            current_num_experts, args.num_topk,
-            global_rank, current_num_ranks,
+            num_experts, args.num_topk,
+            global_rank, num_ranks, max_num_ranks,
             num_iters=50,
         )
-        print(
-            f"[PID {os.getpid()}] rank={global_rank} -> "
-            f"phase {plan.get_phase()} vllm-like warmup: {'PASS' if ok else 'FAIL'}",
-            flush=True,
-        )
+        print(f"[PID {os.getpid()}] rank={global_rank} phase {phase}: "
+              f"{'PASS' if ok else 'FAIL'}", flush=True)
 
+        # Clean up any failed ranks
         buffer.query_mask_buffer(mask_status)
-        newly_failed_ranks = set()
-        for r in range(current_num_ranks):
-            if mask_status[r].item() != 0 and r in remote_ranks:
-                newly_failed_ranks.add(r)
-
-        if len(newly_failed_ranks) > 0:
-            print(
-                f"[PID {os.getpid()}] rank={global_rank} -> "
-                f"detected failures: {newly_failed_ranks}",
-                flush=True,
-            )
-            remote_ranks.difference_update(newly_failed_ranks)
-            buffer.disconnect_ranks(list(newly_failed_ranks))
+        failed = {r for r in range(num_ranks)
+                  if mask_status[r].item() != 0 and r in remote_ranks}
+        if failed:
+            remote_ranks.difference_update(failed)
+            buffer.disconnect_ranks(list(failed))
             import time
             time.sleep(5)
-
-        print(
-            f"[PID {os.getpid()}] rank={global_rank} -> "
-            f"end phase {plan.get_phase()}",
-            flush=True,
-        )
 
         if not plan.next():
             break
