@@ -16,15 +16,27 @@ The bug does NOT reproduce when any of the above conditions is removed:
 
 Launch via elastic_independent.py:
 
-  RDMA (reproduces the bug):
-    python3 elastic_independent.py \
-        --disable-ll-nvlink \
+  RDMA + split mode (FAILS -- reproduces the bug):
+    python3 elastic_independent.py --disable-ll-nvlink \
         --num-tokens 256 --hidden-dim 2048 \
         --num-experts-per-rank 16 --num-topk 6 \
         --plan double_expansion.json --num-processes 8
 
-  NVLink (should pass cleanly):
+  RDMA + combined mode (PASSES -- proves split mode is required):
+    python3 elastic_independent.py --disable-ll-nvlink --combined-mode \
+        --num-tokens 256 --hidden-dim 2048 \
+        --num-experts-per-rank 16 --num-topk 6 \
+        --plan double_expansion.json --num-processes 8
+
+  NVLink + split mode (PASSES -- proves RDMA transport is required):
     python3 elastic_independent.py \
+        --num-tokens 256 --hidden-dim 2048 \
+        --num-experts-per-rank 16 --num-topk 6 \
+        --plan double_expansion.json --num-processes 8
+
+  Compare with elastic.py using mp.spawn (PASSES -- proves independent
+  processes are required):
+    python3 elastic.py --disable-ll-nvlink \
         --num-tokens 256 --hidden-dim 2048 \
         --num-experts-per-rank 16 --num-topk 6 \
         --plan double_expansion.json --num-processes 8
@@ -63,6 +75,7 @@ def handle_sigterm(signum, frame, buffer, plan, rank_client):
 def split_send_recv_stress_test(
     buffer, num_tokens, hidden, num_experts, num_topk,
     rank, num_ranks, max_num_ranks, num_iters=50,
+    use_split_mode=True,
 ):
     """Run dispatch→combine using split SEND_ONLY mode (return_recv_hook=True).
 
@@ -87,12 +100,16 @@ def split_send_recv_stress_test(
     ).abs()
 
     for _ in range(num_iters):
-        # Dispatch: SEND_ONLY
-        packed_recv_x, _, handle, _, dispatch_hook = buffer.dispatch(
+        # Dispatch
+        packed_recv_x, _, handle, event, dispatch_hook = buffer.dispatch(
             x, topk_idx, num_tokens, num_experts,
-            use_fp8=False, async_finish=False, return_recv_hook=True,
+            use_fp8=False, async_finish=False,
+            return_recv_hook=use_split_mode,
         )
-        dispatch_hook()
+        if use_split_mode:
+            dispatch_hook()
+        else:
+            event.current_stream_wait()
 
         # Simulated expert computation
         expert_out = (
@@ -101,14 +118,17 @@ def split_send_recv_stress_test(
             else packed_recv_x[0].clone()
         )
 
-        # Combine: SEND_ONLY
+        # Combine
         out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        _, _, combine_hook = buffer.combine(
+        _, event, combine_hook = buffer.combine(
             expert_out, topk_idx, topk_weights, handle,
             async_finish=False, zero_copy=False,
-            return_recv_hook=True, out=out,
+            return_recv_hook=use_split_mode, out=out,
         )
-        combine_hook()
+        if use_split_mode:
+            combine_hook()
+        else:
+            event.current_stream_wait()
 
     # Check for RDMA failures (auto-masked ranks)
     mask = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
@@ -135,6 +155,9 @@ def main():
     parser.add_argument("--tcp-server", type=str, required=True)
     parser.add_argument("--kineto", action="store_true")
     parser.add_argument("--disable-ll-nvlink", action="store_true")
+    parser.add_argument("--combined-mode", action="store_true",
+                        help="Use combined SEND+RECV instead of split SEND_ONLY. "
+                             "With this flag the bug should NOT reproduce.")
     args = parser.parse_args()
 
     server_addr = args.tcp_server
@@ -216,11 +239,12 @@ def main():
         num_ranks = max(active_ranks) + 1
         num_experts = args.num_experts_per_rank * num_ranks
 
+        use_split = not args.combined_mode
         ok = split_send_recv_stress_test(
             buffer, args.num_tokens, args.hidden_dim,
             num_experts, args.num_topk,
             global_rank, num_ranks, max_num_ranks,
-            num_iters=50,
+            num_iters=50, use_split_mode=use_split,
         )
         print(f"[PID {os.getpid()}] rank={global_rank} phase {phase}: "
               f"{'PASS' if ok else 'FAIL'}", flush=True)

@@ -47,6 +47,8 @@ def main():
     parser.add_argument("--tcp-server", type=str, default=None)
     parser.add_argument("--kineto", action="store_true")
     parser.add_argument("--disable-ll-nvlink", action="store_true")
+    parser.add_argument("--combined-mode", action="store_true",
+                        help="Use combined SEND+RECV instead of split SEND_ONLY")
     args = parser.parse_args()
 
     server_addr = args.tcp_server or "127.0.0.1"
@@ -74,6 +76,8 @@ def main():
         worker_args.append("--kineto")
     if args.disable_ll_nvlink:
         worker_args.append("--disable-ll-nvlink")
+    if args.combined_mode:
+        worker_args.append("--combined-mode")
 
     processes = []
     for i in range(args.num_processes):
