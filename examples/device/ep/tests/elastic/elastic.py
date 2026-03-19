@@ -110,7 +110,6 @@ def test_main(
     seed: int = 0,
     kineto: bool = False,
     fault_tolerance_test: bool = False,
-    force_split_mode: bool = False,
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -192,12 +191,12 @@ def test_main(
         all_topk_idx[r] = r_topk_idx
 
     # Check dispatch correctness
-    do_check = not force_split_mode
+    do_check = True
     hash_value, num_times = 0, 0
     timer = None
-    for current_x in ([x_list[0]] if force_split_mode else x_list):
-        for return_recv_hook in ((True,) if force_split_mode else (False, True)):
-            for dispatch_use_fp8 in ((False,) if force_split_mode else (False, True)):
+    for current_x in x_list:
+        for return_recv_hook in (False, True):
+            for dispatch_use_fp8 in (False, True):
                 for round_scale in (False, True) if dispatch_use_fp8 else (False,):
                     for use_ue8m0 in (False, True) if round_scale else (False,):
                         num_times += 1
@@ -574,26 +573,11 @@ def worker(torch_rank: int, args: argparse.Namespace):
         current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
         current_num_experts = args.num_experts_per_rank * current_num_ranks
 
-        if args.force_split_mode:
-            _split_stress(
-                buffer, args.num_tokens, args.hidden_dim,
-                current_num_experts, args.num_topk,
-                global_rank, current_num_ranks, max_num_ranks,
-            )
-        else:
-            test_main(
-                args.num_tokens,
-                args.hidden_dim,
-                current_num_experts,
-                args.num_topk,
-                global_rank,
-                current_num_ranks,
-                max_num_ranks,
-                buffer,
-                kineto=args.kineto,
-                fault_tolerance_test=kill_rank,
-                force_split_mode=False,
-            )
+        _split_stress(
+            buffer, args.num_tokens, args.hidden_dim,
+            current_num_experts, args.num_topk,
+            global_rank, current_num_ranks, max_num_ranks,
+        )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
         newly_failed_ranks = set()
@@ -631,13 +615,6 @@ def run_server():
 def main():
     parser = argparse.ArgumentParser(description="Elastic EP Test")
     parser.add_argument(
-        "--subprocess-worker",
-        type=int,
-        default=None,
-        metavar="TORCH_RANK",
-        help=argparse.SUPPRESS,  # Internal: used when re-launching as subprocess
-    )
-    parser.add_argument(
         "--plan", type=str, default="plan.json", help="Path to plan file"
     )
     parser.add_argument(
@@ -663,25 +640,7 @@ def main():
         action="store_true",
         help="Disable NVLink communication for low-latency kernels",
     )
-    parser.add_argument(
-        "--use-subprocess",
-        action="store_true",
-        help="Launch workers as independent subprocess.Popen processes "
-             "instead of torch.multiprocessing.spawn",
-    )
-    parser.add_argument(
-        "--force-split-mode",
-        action="store_true",
-        help="Force return_recv_hook=True (split SEND_ONLY mode) for all "
-             "dispatch/combine calls instead of iterating both modes",
-    )
-
     args = parser.parse_args()
-
-    # If launched as a subprocess worker, run worker() directly and exit
-    if args.subprocess_worker is not None:
-        worker(args.subprocess_worker, args)
-        return
 
     if not args.tcp_server:
         print("Starting TCPStore and rank server locally", flush=True)
@@ -689,9 +648,7 @@ def main():
         server_process.start()
         time.sleep(0.5)
 
-    if args.use_subprocess:
-        _launch_subprocess_workers(args)
-    elif args.num_processes == 1:
+    if args.num_processes == 1:
         worker(0, args)
     else:
         ctx = torch.multiprocessing.spawn(
@@ -707,42 +664,6 @@ def main():
                 p.join()
             except Exception:
                 pass
-
-
-def _launch_subprocess_workers(args):
-    """Launch each worker as a fully independent subprocess.Popen process."""
-    import subprocess
-
-    server_addr = args.tcp_server if args.tcp_server else "127.0.0.1"
-    script = os.path.abspath(__file__)
-
-    worker_args = [
-        "--plan", args.plan,
-        "--num-tokens", str(args.num_tokens),
-        "--num-experts-per-rank", str(args.num_experts_per_rank),
-        "--hidden-dim", str(args.hidden_dim),
-        "--num-topk", str(args.num_topk),
-        "--tcp-server", server_addr,
-    ]
-    if args.kineto:
-        worker_args.append("--kineto")
-    if args.disable_ll_nvlink:
-        worker_args.append("--disable-ll-nvlink")
-    if args.force_split_mode:
-        worker_args.append("--force-split-mode")
-
-    processes = []
-    for i in range(args.num_processes):
-        cmd = [
-            sys.executable, script,
-            "--subprocess-worker", str(i),
-        ] + worker_args
-        proc = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
-        processes.append(proc)
-        time.sleep(0.1)
-
-    for proc in processes:
-        proc.wait()
 
 
 if __name__ == "__main__":
