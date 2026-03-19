@@ -103,7 +103,8 @@ def split_send_recv_stress_test(
         # Dispatch
         packed_recv_x, _, handle, event, dispatch_hook = buffer.dispatch(
             x, topk_idx, num_tokens, num_experts,
-            use_fp8=False, async_finish=False,
+            use_fp8=False,
+            async_finish=not use_split_mode,
             return_recv_hook=use_split_mode,
         )
         if use_split_mode:
@@ -122,7 +123,7 @@ def split_send_recv_stress_test(
         out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
         _, event, combine_hook = buffer.combine(
             expert_out, topk_idx, topk_weights, handle,
-            async_finish=False, zero_copy=False,
+            async_finish=not use_split_mode, zero_copy=False,
             return_recv_hook=use_split_mode, out=out,
         )
         if use_split_mode:
@@ -137,8 +138,7 @@ def split_send_recv_stress_test(
     masked = [r for r in range(num_ranks) if mask[r].item() != 0]
     if masked:
         print(
-            f"[PID {os.getpid()}] rank={rank} FAIL: "
-            f"masked ranks (RDMA delivery failure): {masked}",
+            f"global_rank={rank} -> RDMA delivery failure, masked ranks: {masked}",
             flush=True,
         )
     return len(masked) == 0
@@ -170,15 +170,14 @@ def main():
     )
     if plan.current_phase == -1:
         print(
-            f"[PID {os.getpid()}] rank {global_rank}: "
-            f"no phases found, exiting",
+            f"Process {args.torch_rank} -> no plan phases were found for rank {global_rank}, exiting",
             flush=True,
         )
         return
 
     max_num_ranks = plan.get_max_rank() + 1
     print(
-        f"[PID {os.getpid()}] rank={global_rank}, local_rank={local_rank}",
+        f"Process {args.torch_rank} -> global_rank={global_rank}, local_rank={local_rank}",
         flush=True,
     )
 
@@ -215,55 +214,79 @@ def main():
     mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
 
     while True:
-        phase = plan.get_phase()
+        print(
+            f"global_rank={global_rank}, local_rank={local_rank} -> start phase {plan.get_phase()}",
+            flush=True,
+        )
+
         added_ranks = plan.get_new_ranks()
         cleanly_removed = plan.get_removed_ranks()
 
         if global_rank in cleanly_removed:
-            rank_client.release_rank(user_context=phase)
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> this rank is being removed in this phase, exiting",
+                flush=True,
+            )
+            rank_client.release_rank(user_context=plan.get_phase())
             break
 
-        if added_ranks:
-            print(f"[PID {os.getpid()}] rank={global_rank} phase {phase}: "
-                  f"connecting {added_ranks}", flush=True)
+        if len(added_ranks) > 0:
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> adding connections to {added_ranks}",
+                flush=True,
+            )
             buffer.connect_ranks(added_ranks)
             remote_ranks.update(added_ranks)
 
-        if cleanly_removed:
+        if len(cleanly_removed) > 0:
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> removing connections to {cleanly_removed}",
+                flush=True,
+            )
             buffer.disconnect_ranks(cleanly_removed)
             remote_ranks.difference_update(cleanly_removed)
             import time
             time.sleep(5)
 
-        active_ranks = plan.get_active_ranks()
-        num_ranks = max(active_ranks) + 1
-        num_experts = args.num_experts_per_rank * num_ranks
+        active_ranks_list = plan.get_active_ranks()
+        current_num_ranks = max(active_ranks_list) + 1
+        num_experts = args.num_experts_per_rank * current_num_ranks
 
         use_split = not args.combined_mode
         ok = split_send_recv_stress_test(
             buffer, args.num_tokens, args.hidden_dim,
             num_experts, args.num_topk,
-            global_rank, num_ranks, max_num_ranks,
+            global_rank, current_num_ranks, max_num_ranks,
             num_iters=50, use_split_mode=use_split,
         )
-        print(f"[PID {os.getpid()}] rank={global_rank} phase {phase}: "
-              f"{'PASS' if ok else 'FAIL'}", flush=True)
 
-        # Clean up any failed ranks
         buffer.query_mask_buffer(mask_status)
-        failed = {r for r in range(num_ranks)
-                  if mask_status[r].item() != 0 and r in remote_ranks}
-        if failed:
-            remote_ranks.difference_update(failed)
-            buffer.disconnect_ranks(list(failed))
+        newly_failed_ranks = set()
+        for r in range(current_num_ranks):
+            if mask_status[r].item() != 0 and r in remote_ranks:
+                newly_failed_ranks.add(r)
+
+        if len(newly_failed_ranks) > 0:
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> detected unexpected rank failures: {newly_failed_ranks}, cleaning up...",
+                flush=True,
+            )
+            remote_ranks.difference_update(newly_failed_ranks)
+            buffer.disconnect_ranks(list(newly_failed_ranks))
             import time
             time.sleep(5)
+
+        print(
+            f"global_rank={global_rank}, local_rank={local_rank} -> end phase {plan.get_phase()}",
+            flush=True,
+        )
 
         if not plan.next():
             break
 
     buffer.destroy()
-    print(f"[PID {os.getpid()}] rank={global_rank} -> done", flush=True)
+
+    print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
 
 
 if __name__ == "__main__":
