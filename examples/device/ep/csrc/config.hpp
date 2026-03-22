@@ -66,8 +66,11 @@ struct EPLayout {
         return reinterpret_cast<out_ptr_t>(reinterpret_cast<count_ptr_t>(ptr) + count);
     }
 
-    EPLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+    EPLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts,
+             int max_num_signaling_entries = 0) {
         const int num_scales = hidden / 128;
+        if (max_num_signaling_entries <= 0)
+            max_num_signaling_entries = num_experts;
 
         // Dispatch and combine layout:
         //  - 2 symmetric odd/even send buffer
@@ -96,10 +99,10 @@ struct EPLayout {
         EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
         total_bytes += recv_buffer_bytes * 2;
 
-        // Symmetric signaling buffers
-        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(uint64_t);
-        size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
-        size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
+        // Symmetric signaling buffers — sized for max_num_signaling_entries so
+        // the signaling region occupies a fixed footprint across topology changes,
+        // preventing send/recv buffer data from aliasing signaling slots.
+        size_t signaling_buffer_bytes = static_cast<size_t>(max_num_signaling_entries) * sizeof(uint64_t);
         size_t signaling_buffer_bytes_aligned = align_up<size_t>(signaling_buffer_bytes, 128);
         total_bytes += signaling_buffer_bytes_aligned * 2;
 
@@ -108,7 +111,7 @@ struct EPLayout {
         // so you may see some parameters are duplicated
         for (int i = 0; i < 2; ++ i) {
             buffers[i] = {
-                static_cast<int>(signaling_buffer_bytes / sizeof(uint64_t)),
+                static_cast<int>(max_num_signaling_entries),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 + recv_buffer_bytes * i),
                 advance<uint64_t*>(rdma_buffer, signaling_buffer_bytes_aligned * i),

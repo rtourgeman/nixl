@@ -299,12 +299,6 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     _nixl_ep_memory_views_create();
 
-    buffer_idx = 0;
-    size_t cur_num_experts = static_cast<size_t>(num_ranks) * max_experts_per_rank;
-    size_t signaling_bytes = cur_num_experts * sizeof(uint64_t);
-    size_t signaling_aligned = align_up<size_t>(signaling_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
-    CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, 2 * signaling_aligned));
-
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Ready to use
@@ -325,12 +319,6 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     _nixl_ep_memory_views_destroy();
 
     _nixl_ep_memory_views_create();
-
-    buffer_idx = 0;
-    size_t cur_num_experts = static_cast<size_t>(num_ranks) * max_experts_per_rank;
-    size_t signaling_bytes = cur_num_experts * sizeof(uint64_t);
-    size_t signaling_aligned = align_up<size_t>(signaling_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
-    CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, 2 * signaling_aligned));
 
     _nixl_agents_peer_info_cleanup(remote_ranks_list);
 
@@ -385,7 +373,8 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     int num_local_experts = num_experts / num_ranks;
 
     // Buffer control
-    EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    int max_signaling = max_num_ranks * max_experts_per_rank;
+    EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, max_signaling);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
@@ -500,7 +489,8 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
 
     // Buffer control
-    EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    int max_signaling = max_num_ranks * max_experts_per_rank;
+    EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, max_signaling);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
@@ -564,7 +554,8 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
 
 torch::Tensor
 Buffer::get_next_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const {
-    EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    int max_signaling = max_num_ranks * max_experts_per_rank;
+    EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, max_signaling);
 
     auto buffer = layout.buffers[buffer_idx];
     auto dtype = torch::kBFloat16;

@@ -550,10 +550,6 @@ def worker(torch_rank: int, args: argparse.Namespace):
         current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
         current_num_experts = args.num_experts_per_rank * current_num_ranks
 
-        # Barrier ensures all ranks have finished connect/disconnect (including
-        # signaling buffer reset) before any rank starts dispatching.
-        buffer.barrier()
-
         test_main(
             args.num_tokens,
             args.hidden_dim,
