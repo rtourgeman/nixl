@@ -168,7 +168,7 @@ def test_main(
         all_topk_idx[r] = r_topk_idx
 
     # Check dispatch correctness
-    do_check = False
+    do_check = True
     hash_value, num_times = 0, 0
     timer = None
     for current_x in x_list:
@@ -549,6 +549,10 @@ def worker(torch_rank: int, args: argparse.Namespace):
         active_ranks_list = plan.get_active_ranks()
         current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
         current_num_experts = args.num_experts_per_rank * current_num_ranks
+
+        # Barrier ensures all ranks have finished connect/disconnect (including
+        # signaling buffer reset) before any rank starts dispatching.
+        buffer.barrier()
 
         test_main(
             args.num_tokens,

@@ -299,6 +299,12 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     _nixl_ep_memory_views_create();
 
+    buffer_idx = 0;
+    size_t cur_num_experts = static_cast<size_t>(num_ranks) * max_experts_per_rank;
+    size_t signaling_bytes = cur_num_experts * sizeof(uint64_t);
+    size_t signaling_aligned = align_up<size_t>(signaling_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+    CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, 2 * signaling_aligned));
+
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Ready to use
@@ -319,6 +325,12 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     _nixl_ep_memory_views_destroy();
 
     _nixl_ep_memory_views_create();
+
+    buffer_idx = 0;
+    size_t cur_num_experts = static_cast<size_t>(num_ranks) * max_experts_per_rank;
+    size_t signaling_bytes = cur_num_experts * sizeof(uint64_t);
+    size_t signaling_aligned = align_up<size_t>(signaling_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+    CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, 2 * signaling_aligned));
 
     _nixl_agents_peer_info_cleanup(remote_ranks_list);
 
