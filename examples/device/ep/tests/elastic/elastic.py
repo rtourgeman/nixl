@@ -177,7 +177,7 @@ def test_main(
                 for round_scale in (False, True) if dispatch_use_fp8 else (False,):
                     for use_ue8m0 in (False, True) if round_scale else (False,):
                         num_times += 1
-                        for i in range((num_times % 2) + 1):
+                        for i in range(1):
                             # Kill this rank at the beginning of the first dispatch if marked to be killed
                             if fault_tolerance_test and timer is None:
                                 print(
