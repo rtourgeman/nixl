@@ -326,6 +326,23 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     _nixl_agents_peer_info_gather(new_ranks);
 
+    // Debug: dump signaling overlap region to check for stale values
+    {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        size_t cur_experts = static_cast<size_t>(num_ranks) * max_experts_per_rank;
+        size_t sig_aligned = ((cur_experts * sizeof(uint64_t) + 127) / 128) * 128;
+        for (size_t offset = 0; offset < 2 * sig_aligned; offset += 512) {
+            uint64_t vals[8];
+            size_t bytes_to_copy = std::min<size_t>(64, 2 * sig_aligned - offset);
+            CUDA_CHECK(cudaMemcpy(vals, static_cast<uint8_t*>(rdma_buffer_ptr) + offset,
+                                  bytes_to_copy, cudaMemcpyDeviceToHost));
+            printf("rank %d signaling @%zu: %lu %lu %lu %lu %lu %lu %lu %lu\n",
+                   rank, offset, vals[0], vals[1], vals[2], vals[3],
+                   vals[4], vals[5], vals[6], vals[7]);
+        }
+        fflush(stdout);
+    }
+
     _nixl_ep_memory_views_destroy();
 
     _nixl_ep_memory_views_create();
