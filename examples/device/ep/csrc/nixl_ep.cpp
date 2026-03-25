@@ -369,6 +369,16 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     num_ranks = max_rank + 1;  // Sparse indexing maintained
 
     _nixl_ep_memory_views_create();
+
+    // Clear signaling regions and reset double-buffer index so the
+    // new EP group starts with clean state.  Without this, stale
+    // dispatch/combine flags from the old group carry over and
+    // cause the next dispatch or combine to deadlock.
+    int num_experts = max_num_ranks * max_experts_per_rank;
+    size_t sig_bytes = static_cast<size_t>(num_experts) * sizeof(uint64_t);
+    size_t sig_aligned = align_up<size_t>(sig_bytes, 128);
+    CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, sig_aligned * 2));
+    buffer_idx = 0;
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
