@@ -295,6 +295,30 @@ void Buffer::_nixl_agents_peer_info_gather(std::vector<int>& ranks) {
     }
 }
 
+void Buffer::_reset_signaling_for_group_transition(const char* caller) {
+    // The double-buffering protocol leaves the "next" signaling slot
+    // dirty between operations (lazy clean). This is fine during
+    // steady-state, but when the EP group changes (connect/disconnect),
+    // the stale values from the old group cause the first post-reconfig
+    // combine to read garbage. Clear both slots and reset buffer_idx
+    // so the new group starts clean.
+    int num_experts = max_num_ranks * max_experts_per_rank;
+    size_t sig_bytes = static_cast<size_t>(num_experts) * sizeof(uint64_t);
+    size_t sig_aligned = align_up<size_t>(sig_bytes, 128);
+    size_t total_sig = sig_aligned * 2;
+
+    int old_buffer_idx = buffer_idx;
+    CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, total_sig));
+    buffer_idx = 0;
+    reconfig_dispatch_at = dispatch_count;
+
+    printf("[NIXL-DIAG] rank %d: _reset_signaling_for_group_transition "
+           "(%s) — cleared %zu bytes, buffer_idx %d→0, "
+           "dispatch_count=%lu\n",
+           rank, caller, total_sig, old_buffer_idx, dispatch_count);
+    fflush(stdout);
+}
+
 void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std::optional<std::vector<nixl_blob_t>>& remote_mds) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
@@ -334,6 +358,8 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     _nixl_ep_memory_views_create();
 
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    _reset_signaling_for_group_transition("connect_ranks");
 
     printf("[NIXL-DIAG] rank %d: connect_ranks DONE — buffer_idx=%d, "
            "num_ranks=%d, dispatch_count=%lu, combine_count=%lu\n",
@@ -419,7 +445,9 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
 
     _nixl_ep_memory_views_create();
 
-    // Dump signaling state AFTER recreate
+    _reset_signaling_for_group_transition("disconnect_ranks");
+
+    // Dump signaling state AFTER recreate + clear
     {
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<uint8_t> host_raw(sig_aligned * 2);
@@ -477,14 +505,58 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     int num_local_experts = num_experts / num_ranks;
 
     dispatch_count++;
-    if (reconfig_pending_log || dispatch_count <= 2) {
-        printf("[NIXL-DIAG] rank %d: dispatch #%lu — buffer_idx=%d, "
-               "num_tokens=%d, num_experts=%d, num_ranks=%d%s\n",
-               rank, dispatch_count, buffer_idx,
-               num_tokens, num_experts, num_ranks,
-               reconfig_pending_log ? " [FIRST AFTER RECONFIG]" : "");
+    bool log_this_dispatch = dispatch_count <= 2
+        || reconfig_pending_log
+        || post_warmup_pending_log;
+    if (log_this_dispatch) {
+        // Full state dump on first dispatch after reconfig
+        int num_exp = max_num_ranks * max_experts_per_rank;
+        size_t sb = static_cast<size_t>(num_exp) * sizeof(uint64_t);
+        size_t sa = align_up<size_t>(sb, 128);
+        std::vector<uint8_t> hr(sa * 2);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(hr.data(), rdma_buffer_ptr,
+                              sa * 2, cudaMemcpyDeviceToHost));
+        auto* s0 = reinterpret_cast<uint64_t*>(hr.data());
+        auto* s1 = reinterpret_cast<uint64_t*>(hr.data() + sa);
+        int nz0 = 0, nz1 = 0;
+        for (int i = 0; i < num_exp; i++) {
+            if (s0[i] != 0) nz0++;
+            if (s1[i] != 0) nz1++;
+        }
+        // Read mask buffer
+        std::vector<int> mask_host(max_num_ranks);
+        CUDA_CHECK(cudaMemcpy(mask_host.data(), mask_buffer_ptr,
+                              max_num_ranks * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        int num_masked = 0;
+        for (int i = 0; i < max_num_ranks; i++) {
+            if (mask_host[i] != 0) num_masked++;
+        }
+        const char* tag = post_warmup_pending_log
+            ? " [FIRST REAL AFTER WARMUP]"
+            : (reconfig_pending_log ? " [FIRST AFTER RECONFIG]" : "");
+        printf("[NIXL-DIAG] rank %d: dispatch #%lu%s — "
+               "buffer_idx=%d, num_tokens=%d, num_experts=%d, "
+               "num_ranks=%d, max_num_ranks=%d, "
+               "dispatch_count=%lu, combine_count=%lu, "
+               "signaling slot0: %d/%d nz, slot1: %d/%d nz, "
+               "masked_ranks: %d/%d",
+               rank, dispatch_count, tag,
+               buffer_idx, num_tokens, num_experts,
+               num_ranks, max_num_ranks,
+               dispatch_count, combine_count,
+               nz0, num_exp, nz1, num_exp,
+               num_masked, max_num_ranks);
+        if (num_masked > 0) {
+            printf(" [masked:");
+            for (int i = 0; i < max_num_ranks; i++) {
+                if (mask_host[i] != 0) printf(" %d", i);
+            }
+            printf("]");
+        }
+        printf("\n");
         fflush(stdout);
-        reconfig_pending_log = false;
     }
 
     // Buffer control
@@ -604,13 +676,40 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
 
     combine_count++;
-    if (reconfig_pending_log || combine_count <= 2) {
-        printf("[NIXL-DIAG] rank %d: combine #%lu — buffer_idx=%d, "
-               "num_combined_tokens=%d, num_experts=%d, num_ranks=%d%s\n",
-               rank, combine_count, buffer_idx,
-               num_combined_tokens, num_experts, num_ranks,
-               reconfig_pending_log ? " [FIRST AFTER RECONFIG]" : "");
+    bool log_this_combine = combine_count <= 2
+        || reconfig_pending_log
+        || post_warmup_pending_log;
+    if (log_this_combine) {
+        int num_exp = max_num_ranks * max_experts_per_rank;
+        size_t sb = static_cast<size_t>(num_exp) * sizeof(uint64_t);
+        size_t sa = align_up<size_t>(sb, 128);
+        std::vector<uint8_t> hr(sa * 2);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(hr.data(), rdma_buffer_ptr,
+                              sa * 2, cudaMemcpyDeviceToHost));
+        auto* s0 = reinterpret_cast<uint64_t*>(hr.data());
+        auto* s1 = reinterpret_cast<uint64_t*>(hr.data() + sa);
+        int nz0 = 0, nz1 = 0;
+        for (int i = 0; i < num_exp; i++) {
+            if (s0[i] != 0) nz0++;
+            if (s1[i] != 0) nz1++;
+        }
+        const char* ctag = post_warmup_pending_log
+            ? " [FIRST REAL AFTER WARMUP]"
+            : (reconfig_pending_log ? " [FIRST AFTER RECONFIG]" : "");
+        printf("[NIXL-DIAG] rank %d: combine #%lu%s — "
+               "buffer_idx=%d, num_combined_tokens=%d, "
+               "num_experts=%d, num_ranks=%d, "
+               "dispatch_count=%lu, combine_count=%lu, "
+               "signaling slot0: %d/%d nz, slot1: %d/%d nz\n",
+               rank, combine_count, ctag,
+               buffer_idx, num_combined_tokens,
+               num_experts, num_ranks,
+               dispatch_count, combine_count,
+               nz0, num_exp, nz1, num_exp);
         fflush(stdout);
+        reconfig_pending_log = false;
+        post_warmup_pending_log = false;
     }
 
     // Buffer control
@@ -675,6 +774,14 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
 
     // Return values
     return {combined_x, event, recv_hook};
+}
+
+void Buffer::mark_warmup_complete() {
+    post_warmup_pending_log = true;
+    printf("[NIXL-DIAG] rank %d: mark_warmup_complete — "
+           "dispatch_count=%lu, combine_count=%lu, buffer_idx=%d\n",
+           rank, dispatch_count, combine_count, buffer_idx);
+    fflush(stdout);
 }
 
 torch::Tensor
@@ -903,7 +1010,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_next_combine_buffer", &nixl_ep::Buffer::get_next_combine_buffer)
         .def("get_local_metadata", [](const nixl_ep::Buffer &buffer) -> pybind11::bytes {
             return pybind11::bytes(buffer.get_local_metadata());
-        });
+        })
+        .def("mark_warmup_complete", &nixl_ep::Buffer::mark_warmup_complete);
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<nixl_ep::topk_idx_t>::value);
     m.def("is_sm90_compiled", nixl_ep::is_sm90_compiled);
 }

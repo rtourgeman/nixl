@@ -101,6 +101,8 @@ private:
     uint64_t dispatch_count = 0;
     uint64_t combine_count = 0;
     bool reconfig_pending_log = false;
+    uint64_t reconfig_dispatch_at = 0;
+    bool post_warmup_pending_log = false;
 
     // Whether explicit `destroy()` is required.
     bool explicitly_destroy;
@@ -128,6 +130,7 @@ private:
     void _nixl_ep_memory_views_create(void);
     void _nixl_ep_memory_views_destroy(void);
     void _nixl_ep_destroy(void);
+    void _reset_signaling_for_group_transition(const char* caller);
 
 public:
     Buffer(int rank, bool explicitly_destroy);
@@ -151,6 +154,7 @@ public:
     torch::Stream get_comm_stream() const;
 
     void destroy();
+    void mark_warmup_complete();
 
     void clean_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 
