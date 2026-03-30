@@ -322,17 +322,25 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     if (new_ranks.empty())
         return;
 
-    _nixl_agents_connect(new_ranks, new_ranks_mds);
+    printf("[NIXL-DIAG] rank %d: connect_ranks START — buffer_idx=%d, "
+           "adding %zu ranks, current num_ranks=%d\n",
+           rank, buffer_idx, new_ranks.size(), num_ranks);
+    fflush(stdout);
 
+    _nixl_agents_connect(new_ranks, new_ranks_mds);
     _nixl_agents_peer_info_gather(new_ranks);
 
     _nixl_ep_memory_views_destroy();
-
     _nixl_ep_memory_views_create();
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Ready to use
+    printf("[NIXL-DIAG] rank %d: connect_ranks DONE — buffer_idx=%d, "
+           "num_ranks=%d, dispatch_count=%lu, combine_count=%lu\n",
+           rank, buffer_idx, num_ranks, dispatch_count, combine_count);
+    fflush(stdout);
+
+    reconfig_pending_log = true;
     available = true;
 }
 
@@ -340,11 +348,52 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
 
+    // Dump signaling state BEFORE sync to see what's pending
+    int num_experts_total = max_num_ranks * max_experts_per_rank;
+    size_t sig_bytes = static_cast<size_t>(num_experts_total) * sizeof(uint64_t);
+    size_t sig_aligned = align_up<size_t>(sig_bytes, 128);
+    {
+        std::vector<uint8_t> host_raw(sig_aligned * 2);
+        CUDA_CHECK(cudaMemcpy(host_raw.data(), rdma_buffer_ptr,
+                              sig_aligned * 2, cudaMemcpyDeviceToHost));
+        auto* slot0 = reinterpret_cast<uint64_t*>(host_raw.data());
+        auto* slot1 = reinterpret_cast<uint64_t*>(host_raw.data() + sig_aligned);
+        int nz0 = 0, nz1 = 0;
+        for (int i = 0; i < num_experts_total; i++) {
+            if (slot0[i] != 0) nz0++;
+            if (slot1[i] != 0) nz1++;
+        }
+        printf("[NIXL-DIAG] rank %d: disconnect_ranks BEFORE cudaDeviceSync — "
+               "buffer_idx=%d, removing %zu ranks, "
+               "signaling slot0: %d/%d nz, slot1: %d/%d nz\n",
+               rank, buffer_idx, remote_ranks_list.size(),
+               nz0, num_experts_total, nz1, num_experts_total);
+        fflush(stdout);
+    }
+
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Update mask buffer to mark ranks as inactive
+    // Dump signaling state AFTER sync (local GPU flushed)
+    {
+        std::vector<uint8_t> host_raw(sig_aligned * 2);
+        CUDA_CHECK(cudaMemcpy(host_raw.data(), rdma_buffer_ptr,
+                              sig_aligned * 2, cudaMemcpyDeviceToHost));
+        auto* slot0 = reinterpret_cast<uint64_t*>(host_raw.data());
+        auto* slot1 = reinterpret_cast<uint64_t*>(host_raw.data() + sig_aligned);
+        int nz0 = 0, nz1 = 0;
+        for (int i = 0; i < num_experts_total; i++) {
+            if (slot0[i] != 0) nz0++;
+            if (slot1[i] != 0) nz1++;
+        }
+        printf("[NIXL-DIAG] rank %d: disconnect_ranks AFTER cudaDeviceSync — "
+               "buffer_idx=%d, signaling slot0: %d/%d nz, slot1: %d/%d nz\n",
+               rank, buffer_idx,
+               nz0, num_experts_total, nz1, num_experts_total);
+        fflush(stdout);
+    }
+
     for (int removed_rank : remote_ranks_list) {
-        update_mask_buffer(removed_rank, true);  // mask=true
+        update_mask_buffer(removed_rank, true);
     }
 
     _nixl_ep_memory_views_destroy();
@@ -353,7 +402,6 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
 
     _nixl_agents_disconnect(remote_ranks_list);
 
-    // Remove ranks from remote_ranks vector (arbitrary order)
     for (int removed_rank : remote_ranks_list) {
         remote_ranks.erase(
             std::remove(remote_ranks.begin(), remote_ranks.end(), removed_rank),
@@ -361,14 +409,39 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         );
     }
 
-    int max_rank = rank;  // Include self
+    int max_rank = rank;
     if (!remote_ranks.empty()) {
         max_rank = std::max(max_rank,
                            *std::max_element(remote_ranks.begin(), remote_ranks.end()));
     }
-    num_ranks = max_rank + 1;  // Sparse indexing maintained
+    int old_num_ranks = num_ranks;
+    num_ranks = max_rank + 1;
 
     _nixl_ep_memory_views_create();
+
+    // Dump signaling state AFTER recreate
+    {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<uint8_t> host_raw(sig_aligned * 2);
+        CUDA_CHECK(cudaMemcpy(host_raw.data(), rdma_buffer_ptr,
+                              sig_aligned * 2, cudaMemcpyDeviceToHost));
+        auto* slot0 = reinterpret_cast<uint64_t*>(host_raw.data());
+        auto* slot1 = reinterpret_cast<uint64_t*>(host_raw.data() + sig_aligned);
+        int nz0 = 0, nz1 = 0;
+        for (int i = 0; i < num_experts_total; i++) {
+            if (slot0[i] != 0) nz0++;
+            if (slot1[i] != 0) nz1++;
+        }
+        printf("[NIXL-DIAG] rank %d: disconnect_ranks DONE — "
+               "buffer_idx=%d, num_ranks %d→%d, "
+               "dispatch_count=%lu, combine_count=%lu, "
+               "signaling slot0: %d/%d nz, slot1: %d/%d nz\n",
+               rank, buffer_idx, old_num_ranks, num_ranks,
+               dispatch_count, combine_count,
+               nz0, num_experts_total, nz1, num_experts_total);
+        fflush(stdout);
+    }
+    reconfig_pending_log = true;
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
@@ -402,6 +475,17 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_topk = static_cast<int>(topk_idx.size(1));
     int num_local_experts = num_experts / num_ranks;
+
+    dispatch_count++;
+    if (reconfig_pending_log || dispatch_count <= 2) {
+        printf("[NIXL-DIAG] rank %d: dispatch #%lu — buffer_idx=%d, "
+               "num_tokens=%d, num_experts=%d, num_ranks=%d%s\n",
+               rank, dispatch_count, buffer_idx,
+               num_tokens, num_experts, num_ranks,
+               reconfig_pending_log ? " [FIRST AFTER RECONFIG]" : "");
+        fflush(stdout);
+        reconfig_pending_log = false;
+    }
 
     // Buffer control
     int max_num_experts = max_num_ranks * max_experts_per_rank;
@@ -518,6 +602,16 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     auto hidden = static_cast<int>(x.size(2));
     auto num_topk = static_cast<int>(topk_weights.size(1));
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
+
+    combine_count++;
+    if (reconfig_pending_log || combine_count <= 2) {
+        printf("[NIXL-DIAG] rank %d: combine #%lu — buffer_idx=%d, "
+               "num_combined_tokens=%d, num_experts=%d, num_ranks=%d%s\n",
+               rank, combine_count, buffer_idx,
+               num_combined_tokens, num_experts, num_ranks,
+               reconfig_pending_log ? " [FIRST AFTER RECONFIG]" : "");
+        fflush(stdout);
+    }
 
     // Buffer control
     int max_num_experts = max_num_ranks * max_experts_per_rank;

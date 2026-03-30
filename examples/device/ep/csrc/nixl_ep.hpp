@@ -98,6 +98,9 @@ private:
 
     // After synchronization, this flag will be true
     bool available = false;
+    uint64_t dispatch_count = 0;
+    uint64_t combine_count = 0;
+    bool reconfig_pending_log = false;
 
     // Whether explicit `destroy()` is required.
     bool explicitly_destroy;
