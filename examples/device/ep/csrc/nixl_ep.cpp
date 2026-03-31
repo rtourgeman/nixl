@@ -229,6 +229,40 @@ void Buffer::barrier() {
     ep_kernels::barrier(gpu_ctx, mask_buffer_ptr, compute_stream);
 }
 
+void Buffer::clean_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
+    EP_HOST_ASSERT(num_experts > 0);
+
+    const int max_num_experts = max_num_ranks * max_experts_per_rank;
+    EP_HOST_ASSERT(num_experts <= max_num_experts);
+
+    EPLayout layout(
+        rdma_buffer_ptr,
+        num_max_dispatch_tokens_per_rank,
+        hidden,
+        max_num_ranks,
+        max_num_experts);
+    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+
+    auto clean_0 = layout.buffers[0].clean_meta();
+    auto clean_1 = layout.buffers[1].clean_meta();
+
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto memset_zero = [compute_stream](void* ptr, size_t num_bytes) {
+        CUDA_CHECK(cudaMemsetAsync(ptr, 0, num_bytes, compute_stream));
+    };
+
+    barrier();
+
+    buffer_idx = 0;
+    memset_zero(clean_0.first,static_cast<size_t>(clean_0.second) * sizeof(uint64_t));
+    memset_zero(clean_1.first,static_cast<size_t>(clean_1.second) * sizeof(uint64_t));
+    memset_zero(workspace, NUM_WORKSPACE_BYTES);
+    memset_zero(sync_buffer_ptr, max_num_ranks * sizeof(int));
+    memset_zero(sync_count_ptr, max_num_ranks * sizeof(int));
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
     EP_HOST_ASSERT(!ranks.empty());
     EP_HOST_ASSERT(remote_mds.empty() || remote_mds.size() == ranks.size());
@@ -801,6 +835,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_buffer_tensor", &nixl_ep::Buffer::get_local_buffer_tensor)
         .def("get_comm_stream", &nixl_ep::Buffer::get_comm_stream)
         .def("destroy", &nixl_ep::Buffer::destroy)
+        .def("clean_buffer", &nixl_ep::Buffer::clean_buffer)
         .def("dispatch", &nixl_ep::Buffer::dispatch)
         .def("combine", &nixl_ep::Buffer::combine)
         .def("update_mask_buffer", &nixl_ep::Buffer::update_mask_buffer)
