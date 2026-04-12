@@ -236,34 +236,6 @@ void Buffer::clean_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int 
     EP_HOST_ASSERT(num_experts <= max_num_experts);
 
     _dump_signaling("clean_buffer BEFORE clean (post-graph-capture state)");
-
-    EPLayout layout(
-        rdma_buffer_ptr,
-        num_max_dispatch_tokens_per_rank,
-        hidden,
-        max_num_ranks,
-        max_num_experts);
-    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
-
-    auto clean_0 = layout.buffers[0].clean_meta();
-    auto clean_1 = layout.buffers[1].clean_meta();
-
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto memset_zero = [compute_stream](void* ptr, size_t num_bytes) {
-        CUDA_CHECK(cudaMemsetAsync(ptr, 0, num_bytes, compute_stream));
-    };
-
-    barrier();
-
-    buffer_idx = 0;
-    memset_zero(clean_0.first,static_cast<size_t>(clean_0.second) * sizeof(uint64_t));
-    memset_zero(clean_1.first,static_cast<size_t>(clean_1.second) * sizeof(uint64_t));
-    memset_zero(workspace, NUM_WORKSPACE_BYTES);
-    memset_zero(sync_buffer_ptr, max_num_ranks * sizeof(int));
-    memset_zero(sync_count_ptr, max_num_ranks * sizeof(int));
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-    reconfig_pending_log = true;
 }
 
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
