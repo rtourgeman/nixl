@@ -98,6 +98,10 @@ private:
 
     // After synchronization, this flag will be true
     bool available = false;
+    bool reconfig_pending_log = false;
+    uint64_t dispatch_count = 0;
+
+    void _dump_signaling(const char* label);
 
     // Whether explicit `destroy()` is required.
     bool explicitly_destroy;

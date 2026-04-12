@@ -235,6 +235,8 @@ void Buffer::clean_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int 
     const int max_num_experts = max_num_ranks * max_experts_per_rank;
     EP_HOST_ASSERT(num_experts <= max_num_experts);
 
+    _dump_signaling("clean_buffer BEFORE clean (post-graph-capture state)");
+
     EPLayout layout(
         rdma_buffer_ptr,
         num_max_dispatch_tokens_per_rank,
@@ -261,6 +263,7 @@ void Buffer::clean_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int 
     memset_zero(sync_count_ptr, max_num_ranks * sizeof(int));
 
     CUDA_CHECK(cudaDeviceSynchronize());
+    reconfig_pending_log = true;
 }
 
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
@@ -370,6 +373,54 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     available = true;
 }
 
+void Buffer::_dump_signaling(const char* label) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    int num_experts = max_num_ranks * max_experts_per_rank;
+    size_t sig_bytes = static_cast<size_t>(num_experts) * sizeof(uint64_t);
+    size_t sig_aligned = align_up<size_t>(sig_bytes, 128);
+    std::vector<uint8_t> host_raw(sig_aligned * 2);
+    CUDA_CHECK(cudaMemcpy(host_raw.data(), rdma_buffer_ptr,
+                          sig_aligned * 2, cudaMemcpyDeviceToHost));
+    auto* slot0 = reinterpret_cast<uint64_t*>(host_raw.data());
+    auto* slot1 = reinterpret_cast<uint64_t*>(host_raw.data() + sig_aligned);
+    int nz0 = 0, nz1 = 0;
+    for (int i = 0; i < num_experts; i++) {
+        if (slot0[i] != 0) nz0++;
+        if (slot1[i] != 0) nz1++;
+    }
+    int active_slot = buffer_idx;
+    int active_nz = (active_slot == 0) ? nz0 : nz1;
+    const char* verdict = (nz0 == 0 && nz1 == 0) ? "CLEAN — all zeros, ready for use" :
+                          (active_nz > 0) ? "DIRTY — non-zero in active slot, dispatch will misread as arrived tokens" :
+                                            "DIRTY — non-zero in inactive slot only";
+
+    printf("[NIXL-DIAG] rank %d: %s\n"
+           "  buffer_idx=%d (dispatch reads slot%d), dispatch_count=%lu\n"
+           "  slot0: %d/%d non-zero entries (expected: 0 = clean)\n"
+           "  slot1: %d/%d non-zero entries (expected: 0 = clean)\n"
+           "  verdict: %s\n",
+           rank, label,
+           buffer_idx, active_slot, dispatch_count,
+           nz0, num_experts,
+           nz1, num_experts,
+           verdict);
+
+    // Print first few non-zero values as evidence
+    auto* active = (active_slot == 0) ? slot0 : slot1;
+    if (active_nz > 0) {
+        printf("  first dirty values in active slot%d:", active_slot);
+        int printed = 0;
+        for (int i = 0; i < num_experts && printed < 5; i++) {
+            if (active[i] != 0) {
+                printf(" [expert %d]=%lu", i, active[i]);
+                printed++;
+            }
+        }
+        printf("\n");
+    }
+    fflush(stdout);
+}
+
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
@@ -403,6 +454,7 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     num_ranks = max_rank + 1;  // Sparse indexing maintained
 
     _nixl_ep_memory_views_create();
+    reconfig_pending_log = true;
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
@@ -436,6 +488,12 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_topk = static_cast<int>(topk_idx.size(1));
     int num_local_experts = num_experts / num_ranks;
+
+    dispatch_count++;
+    if (reconfig_pending_log) {
+        _dump_signaling("dispatch FIRST-AFTER-RECONFIG");
+        reconfig_pending_log = false;
+    }
 
     // Buffer control
     int max_num_experts = max_num_ranks * max_experts_per_rank;
