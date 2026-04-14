@@ -27,6 +27,7 @@
 #include "api.cuh"
 #include "nixl_device.cuh"
 #include "utils.cuh"
+#include <cstdio>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
@@ -401,6 +402,18 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               void* workspace, int num_device_sms,
               cudaStream_t stream, int phases, ep_kernels::gpu_nixl_ctx nixl_ctx) {
+    std::fprintf(
+        stderr,
+        "[NixlEP kernel] stage=dispatch stream=%p phases=%d rank=%d tokens=%d hidden=%d topk=%d\n",
+        reinterpret_cast<void*>(stream),
+        phases,
+        rank,
+        num_tokens,
+        hidden,
+        num_topk
+    );
+    std::fflush(stderr);
+
     constexpr int kNumMaxTopK = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -1014,6 +1027,19 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy, ep_kernels::gpu_nixl_ctx nixl_ctx) {
+    std::fprintf(
+        stderr,
+        "[NixlEP kernel] stage=combine stream=%p phases=%d rank=%d tokens=%d hidden=%d topk=%d zero_copy=%d\n",
+        reinterpret_cast<void*>(stream),
+        phases,
+        rank,
+        num_combined_tokens,
+        hidden,
+        num_topk,
+        static_cast<int>(zero_copy)
+    );
+    std::fflush(stderr);
+
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
