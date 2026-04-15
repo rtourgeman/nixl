@@ -27,6 +27,7 @@
 #include "api.cuh"
 #include "nixl_device.cuh"
 #include "utils.cuh"
+#include <atomic>
 #include <cstdio>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
@@ -402,15 +403,14 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               void* workspace, int num_device_sms,
               cudaStream_t stream, int phases, ep_kernels::gpu_nixl_ctx nixl_ctx) {
+    unsigned long long stream_id = 0;
+    CUDA_CHECK(cudaStreamGetId(stream, &stream_id));
     std::fprintf(
         stderr,
-        "[NixlEP kernel] stage=dispatch stream=%p phases=%d rank=%d tokens=%d hidden=%d topk=%d\n",
-        reinterpret_cast<void*>(stream),
+        "[NixlEP kernel Dispatch] stream_id=%llu phases=%d rank=%d\n",
+        stream_id,
         phases,
-        rank,
-        num_tokens,
-        hidden,
-        num_topk
+        rank
     );
     std::fflush(stderr);
 
@@ -1027,16 +1027,14 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy, ep_kernels::gpu_nixl_ctx nixl_ctx) {
+    unsigned long long stream_id = 0;
+    CUDA_CHECK(cudaStreamGetId(stream, &stream_id));
     std::fprintf(
         stderr,
-        "[NixlEP kernel] stage=combine stream=%p phases=%d rank=%d tokens=%d hidden=%d topk=%d zero_copy=%d\n",
-        reinterpret_cast<void*>(stream),
+        "[NixlEP kernel Combine] stream_id=%llu phases=%d rank=%d\n",
+        stream_id,
         phases,
-        rank,
-        num_combined_tokens,
-        hidden,
-        num_topk,
-        static_cast<int>(zero_copy)
+        rank
     );
     std::fflush(stderr);
 
