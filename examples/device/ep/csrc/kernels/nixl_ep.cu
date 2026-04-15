@@ -403,12 +403,10 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               void* workspace, int num_device_sms,
               cudaStream_t stream, int phases, ep_kernels::gpu_nixl_ctx nixl_ctx) {
-    unsigned long long stream_id = 0;
-    CUDA_CHECK(cudaStreamGetId(stream, &stream_id));
     std::fprintf(
         stderr,
-        "[NixlEP kernel Dispatch] stream_id=%llu phases=%d rank=%d\n",
-        stream_id,
+        "[NixlEP kernel Dispatch] stream_handle=%p phases=%d rank=%d\n",
+        reinterpret_cast<void*>(stream),
         phases,
         rank
     );
@@ -1027,12 +1025,10 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy, ep_kernels::gpu_nixl_ctx nixl_ctx) {
-    unsigned long long stream_id = 0;
-    CUDA_CHECK(cudaStreamGetId(stream, &stream_id));
     std::fprintf(
         stderr,
-        "[NixlEP kernel Combine] stream_id=%llu phases=%d rank=%d\n",
-        stream_id,
+        "[NixlEP kernel Combine] stream_handle=%p phases=%d rank=%d\n",
+        reinterpret_cast<void*>(stream),
         phases,
         rank
     );

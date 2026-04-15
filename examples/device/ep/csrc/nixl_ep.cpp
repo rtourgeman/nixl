@@ -414,7 +414,8 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    HOST_LOG_DEBUG("dispatch launch_stream=%s", return_recv_hook ? "compute_stream" : "comm_stream");
+    std::printf("[NixlEP host Dispatch] launch_stream=%s rank=%d\n", return_recv_hook ? "compute_stream" : "comm_stream", rank);
+    std::fflush(stdout);
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
@@ -531,7 +532,8 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    HOST_LOG_DEBUG("combine launch_stream=%s", return_recv_hook ? "compute_stream" : "comm_stream");
+    std::printf("[NixlEP host Combine] launch_stream=%s rank=%d\n", return_recv_hook ? "compute_stream" : "comm_stream", rank);
+    std::fflush(stdout);
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
