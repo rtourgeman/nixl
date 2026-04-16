@@ -108,6 +108,8 @@ private:
     void* workspace = nullptr;
     int* dispatch_send_phase_lock_ptr = nullptr;
     int* combine_send_phase_lock_ptr = nullptr;
+    int* dispatch_phase_state_ptr = nullptr;
+    int* combine_phase_state_ptr = nullptr;
 
     std::unique_ptr<NixlAgentInfo> nixl_agent_info;
     std::vector<NixlPeerInfo> nixl_peer_info;

@@ -63,6 +63,12 @@ __device__ __forceinline__ uint64_t doorbell_flag(int idx) {
     return (idx + 1) % 4 == 0 ? 0 : nixl_gpu_flags::defer;
 }
 
+enum kernel_phase_state_t : int {
+    PHASE_STATE_IDLE = 0,
+    PHASE_STATE_SEND = 1,
+    PHASE_STATE_RECV = 2,
+};
+
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
 __global__ __launch_bounds__(1024, 1) void
 dispatch(void* packed_recv_x, void* packed_recv_x_scales,
@@ -74,7 +80,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          void* rdma_recv_x, uint64_t* rdma_recv_count, void* rdma_x,
          const void* x, const topk_idx_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
-         int* dispatch_send_phase_lock,
+         int* dispatch_send_phase_lock, int* dispatch_phase_state,
          uint64_t* next_clean, int num_next_clean_int,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
@@ -96,11 +102,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     // If a send observes non-zero active count, another dispatch kernel is still in flight.
     if (sm_id == 0 and thread_id == 0 and (phases & EP_SEND_PHASE)) {
         const int prev_active = atomicAdd(dispatch_send_phase_lock, 1);
+        const int prev_phase = atomicExch(dispatch_phase_state, PHASE_STATE_SEND);
         if (prev_active > 0) {
             printf("*****************************************************************************\n");
-            printf("Warning: Dispatch overlap detected on rank %d (active kernels: %d)\n",
+            printf("Warning: Dispatch overlap detected on rank %d (active kernels: %d, previous phase state: %d [0=IDLE,1=SEND,2=RECV])\n",
                    rank,
-                   prev_active + 1);
+                   prev_active + 1,
+                   prev_phase);
             printf("*****************************************************************************\n");
         }
     }
@@ -297,6 +305,10 @@ DISPATCH_RECV:
     if ((phases & EP_RECV_PHASE) == 0)
         return;
 
+    if (sm_id == 0 and thread_id == 0) {
+        atomicExch(dispatch_phase_state, PHASE_STATE_RECV);
+    }
+
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & EP_SEND_PHASE)
         cg::this_grid().sync();
@@ -404,6 +416,7 @@ DISPATCH_RECV:
 
     if (sm_id == 0 and thread_id == 0 and (phases & EP_RECV_PHASE)) {
         const int prev_active = atomicAdd(dispatch_send_phase_lock, -1);
+        atomicExch(dispatch_phase_state, PHASE_STATE_IDLE);
         if (prev_active <= 0) {
             atomicExch(dispatch_send_phase_lock, 0);
         }
@@ -422,7 +435,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
-              int* dispatch_send_phase_lock, void* workspace, int num_device_sms,
+              int* dispatch_send_phase_lock, int* dispatch_phase_state, void* workspace, int num_device_sms,
               cudaStream_t stream, int phases, ep_kernels::gpu_nixl_ctx nixl_ctx) {
     constexpr int kNumMaxTopK = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
@@ -459,7 +472,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
-              dispatch_send_phase_lock, \
+              dispatch_send_phase_lock, dispatch_phase_state, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, \
@@ -640,7 +653,7 @@ combine(void* combined_x,
         int64_t* combine_wait_recv_cost_stats,
         uint64_t* next_clean, int num_next_clean_int,
         int* atomic_clean_flag,
-        int* combine_send_phase_lock,
+        int* combine_send_phase_lock, int* combine_phase_state,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
@@ -661,11 +674,13 @@ combine(void* combined_x,
     // - Unlock when recv finishes.
     if (sm_id == 0 and thread_id == 0 and (phases & EP_SEND_PHASE)) {
         const int prev_active = atomicAdd(combine_send_phase_lock, 1);
+        const int prev_phase = atomicExch(combine_phase_state, PHASE_STATE_SEND);
         if (prev_active > 0) {
             printf("*****************************************************************************\n");
-            printf("Warning: combine overlap detected on rank %d (active kernels: %d)\n",
+            printf("Warning: combine overlap detected on rank %d (active kernels: %d, previous phase state: %d [0=IDLE,1=SEND,2=RECV])\n",
                    rank,
-                   prev_active + 1);
+                   prev_active + 1,
+                   prev_phase);
             printf("*****************************************************************************\n");
         }
     }
@@ -870,6 +885,10 @@ COMBINE_RECV:
     if ((phases & EP_RECV_PHASE) == 0)
         return;
 
+    if (sm_id == 0 and thread_id == 0) {
+        atomicExch(combine_phase_state, PHASE_STATE_RECV);
+    }
+
     // Wait all ranks to arrive
     if (responsible_expert_idx < num_experts) {
         EP_DEVICE_ASSERT(num_warps_per_group > 1);
@@ -1042,6 +1061,7 @@ COMBINE_RECV:
 
     if (sm_id == 0 and thread_id == 0 and (phases & EP_RECV_PHASE)) {
         const int prev_active = atomicAdd(combine_send_phase_lock, -1);
+        atomicExch(combine_phase_state, PHASE_STATE_IDLE);
         if (prev_active <= 0) {
             atomicExch(combine_send_phase_lock, 0);
         }
@@ -1058,7 +1078,7 @@ void combine(void* combined_x,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt,
-             int* combine_send_phase_lock, void* workspace, int num_device_sms,
+             int* combine_send_phase_lock, int* combine_phase_state, void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy, ep_kernels::gpu_nixl_ctx nixl_ctx) {
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
@@ -1107,7 +1127,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               combine_wait_recv_cost_stats, \
               next_clean, num_next_clean_int, \
               atomic_clean_flag, \
-              combine_send_phase_lock, \
+              combine_send_phase_lock, combine_phase_state, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
