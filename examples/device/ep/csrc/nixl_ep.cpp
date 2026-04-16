@@ -141,6 +141,10 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     m_workspace_alloc = std::make_unique<vmm_region>(NUM_WORKSPACE_BYTES);
     workspace = m_workspace_alloc->ptr();
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    CUDA_CHECK(cudaMalloc(&dispatch_send_phase_lock_ptr, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&combine_send_phase_lock_ptr, sizeof(int)));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_send_phase_lock_ptr, 0, sizeof(int), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(combine_send_phase_lock_ptr, 0, sizeof(int), comm_stream));
 
     if (!low_latency_mode) {
         // MoE counter
@@ -324,6 +328,10 @@ void Buffer::destroy() {
     sync_buffer_ptr = nullptr;
     m_sync_count_alloc.reset();
     sync_count_ptr = nullptr;
+    warn_cuda(cudaFree(dispatch_send_phase_lock_ptr), "free dispatch send-phase lock");
+    dispatch_send_phase_lock_ptr = nullptr;
+    warn_cuda(cudaFree(combine_send_phase_lock_ptr), "free combine send-phase lock");
+    combine_send_phase_lock_ptr = nullptr;
 
     if (!low_latency_mode) {
         warn_cuda(cudaFree(local_ht_barrier_counter), "free local ht barrier counter");
@@ -1091,6 +1099,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
                                use_fp8, round_scale, use_ue8m0,
+                               dispatch_send_phase_lock_ptr,
                                timeout_cycles,
                                workspace, num_device_sms,
                                launch_stream, phases, gpu_ctx_ptr);
@@ -1190,7 +1199,9 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                               next_clean_meta.first, next_clean_meta.second,
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
                               num_topk, num_experts, rank, num_ranks,
-                             use_logfmt, timeout_cycles,
+                              use_logfmt,
+                              combine_send_phase_lock_ptr,
+                              timeout_cycles,
                               workspace, num_device_sms,
                               launch_stream, phases, zero_copy, gpu_ctx_ptr);
     };

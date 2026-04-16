@@ -131,6 +131,8 @@ private:
 
     // Workspace
     void* workspace = nullptr;
+    int* dispatch_send_phase_lock_ptr = nullptr;
+    int* combine_send_phase_lock_ptr = nullptr;
 
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
