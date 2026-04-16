@@ -105,6 +105,10 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_rdma_byte
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    CUDA_CHECK(cudaMalloc(&dispatch_send_phase_lock_ptr, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&combine_send_phase_lock_ptr, sizeof(int)));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_send_phase_lock_ptr, 0, sizeof(int), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(combine_send_phase_lock_ptr, 0, sizeof(int), comm_stream));
 
     EP_HOST_ASSERT(max_experts_per_rank > 0);
     CUDA_CHECK(cudaMalloc(&rdma_buffer_ptr, num_rdma_bytes));
@@ -216,6 +220,8 @@ void Buffer::destroy() {
     warn_cuda(cudaFree(mask_buffer_ptr), "free mask buffer");
     warn_cuda(cudaFree(sync_buffer_ptr), "free sync buffer");
     warn_cuda(cudaFree(sync_count_ptr), "free sync-count buffer");
+    warn_cuda(cudaFree(dispatch_send_phase_lock_ptr), "free dispatch send-phase lock");
+    warn_cuda(cudaFree(combine_send_phase_lock_ptr), "free combine send-phase lock");
 
     // Free workspace
     warn_cuda(cudaFree(workspace), "free workspace");
@@ -461,7 +467,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
                                use_fp8, round_scale, use_ue8m0,
-                               workspace, num_device_sms,
+                               dispatch_send_phase_lock_ptr, workspace, num_device_sms,
                                launch_stream, phases, gpu_ctx);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
@@ -559,7 +565,7 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
                               num_topk, num_experts, rank, num_ranks,
                               use_logfmt,
-                              workspace, num_device_sms,
+                              combine_send_phase_lock_ptr, workspace, num_device_sms,
                               launch_stream, phases, zero_copy, gpu_ctx);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));

@@ -74,6 +74,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          void* rdma_recv_x, uint64_t* rdma_recv_count, void* rdma_x,
          const void* x, const topk_idx_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
+         int* dispatch_send_phase_lock,
          uint64_t* next_clean, int num_next_clean_int,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
@@ -88,6 +89,21 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+
+    // Kernel-overlap diagnostics:
+    // - Lock on send entry.
+    // - Unlock when recv finishes.
+    // If a send observes non-zero active count, another dispatch kernel is still in flight.
+    if (sm_id == 0 and thread_id == 0 and (phases & EP_SEND_PHASE)) {
+        const int prev_active = atomicAdd(dispatch_send_phase_lock, 1);
+        if (prev_active > 0) {
+            printf("*****************************************************************************\n");
+            printf("Warning: Dispatch overlap detected on rank %d (active kernels: %d)\n",
+                   rank,
+                   prev_active + 1);
+            printf("*****************************************************************************\n");
+        }
+    }
 
     // May extract UE8M0 from the scales
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
@@ -385,6 +401,13 @@ DISPATCH_RECV:
             }
         }
     }
+
+    if (sm_id == 0 and thread_id == 0 and (phases & EP_RECV_PHASE)) {
+        const int prev_active = atomicAdd(dispatch_send_phase_lock, -1);
+        if (prev_active <= 0) {
+            atomicExch(dispatch_send_phase_lock, 0);
+        }
+    }
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
@@ -399,7 +422,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
-              void* workspace, int num_device_sms,
+              int* dispatch_send_phase_lock, void* workspace, int num_device_sms,
               cudaStream_t stream, int phases, ep_kernels::gpu_nixl_ctx nixl_ctx) {
     constexpr int kNumMaxTopK = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
@@ -414,7 +437,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     // Workspace checks
     auto atomic_counter_per_expert = static_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
-    EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+    EP_HOST_ASSERT((num_experts * 2) * sizeof(int) <= NUM_WORKSPACE_BYTES);
 
     // FP8 checks
     if (use_ue8m0)
@@ -436,6 +459,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
+              dispatch_send_phase_lock, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, \
@@ -616,6 +640,7 @@ combine(void* combined_x,
         int64_t* combine_wait_recv_cost_stats,
         uint64_t* next_clean, int num_next_clean_int,
         int* atomic_clean_flag,
+        int* combine_send_phase_lock,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
@@ -630,6 +655,20 @@ combine(void* combined_x,
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+
+    // Kernel-overlap diagnostics:
+    // - Lock on send entry.
+    // - Unlock when recv finishes.
+    if (sm_id == 0 and thread_id == 0 and (phases & EP_SEND_PHASE)) {
+        const int prev_active = atomicAdd(combine_send_phase_lock, 1);
+        if (prev_active > 0) {
+            printf("*****************************************************************************\n");
+            printf("Warning: combine overlap detected on rank %d (active kernels: %d)\n",
+                   rank,
+                   prev_active + 1);
+            printf("*****************************************************************************\n");
+        }
+    }
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
@@ -1000,6 +1039,13 @@ COMBINE_RECV:
             }
         }
     }
+
+    if (sm_id == 0 and thread_id == 0 and (phases & EP_RECV_PHASE)) {
+        const int prev_active = atomicAdd(combine_send_phase_lock, -1);
+        if (prev_active <= 0) {
+            atomicExch(combine_send_phase_lock, 0);
+        }
+    }
 }
 
 void combine(void* combined_x,
@@ -1012,7 +1058,7 @@ void combine(void* combined_x,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt,
-             void* workspace, int num_device_sms,
+             int* combine_send_phase_lock, void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy, ep_kernels::gpu_nixl_ctx nixl_ctx) {
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
@@ -1061,6 +1107,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               combine_wait_recv_cost_stats, \
               next_clean, num_next_clean_int, \
               atomic_clean_flag, \
+              combine_send_phase_lock, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
