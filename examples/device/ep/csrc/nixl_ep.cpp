@@ -458,8 +458,15 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     }
 
     // Kernel launch
+    const char* stream_type = (launch_stream == comm_stream) ? "COMM" : "COMPUTE";
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
+        fprintf(stderr,
+                "[STREAM-DBG][NIXL-EP] dispatch launch: rank=%d num_ranks=%d "
+                "num_tokens=%d stream=%p stream_type=%s phases=%d\n",
+                rank, num_ranks, num_tokens,
+                (void*)launch_stream.stream(), stream_type, phases);
+        fflush(stderr);
         ep_kernels::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                                packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
                                packed_recv_count.data_ptr<int>(),
@@ -558,8 +565,15 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     }
 
     // Kernel launch
+    const char* combine_stream_type = (launch_stream == comm_stream) ? "COMM" : "COMPUTE";
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
+        fprintf(stderr,
+                "[STREAM-DBG][NIXL-EP] combine launch: rank=%d num_ranks=%d "
+                "num_combined_tokens=%d stream=%p stream_type=%s phases=%d\n",
+                rank, num_ranks, num_combined_tokens,
+                (void*)launch_stream.stream(), combine_stream_type, phases);
+        fflush(stderr);
         ep_kernels::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
