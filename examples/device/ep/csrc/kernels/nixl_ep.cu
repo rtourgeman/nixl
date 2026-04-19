@@ -105,10 +105,14 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const int prev_phase = atomicExch(dispatch_phase_state, PHASE_STATE_SEND);
         if (prev_active > 0) {
             printf("*****************************************************************************\n");
-            printf("Warning: Dispatch overlap detected on rank %d (active kernels: %d, previous phase state: %d [0=IDLE,1=SEND,2=RECV])\n",
+            printf("Warning: Dispatch overlap detected on rank %d "
+                   "(active kernels: %d, previous phase state: %d "
+                   "[0=IDLE,1=SEND,2=RECV]) "
+                   "num_tokens=%d num_ranks=%d num_experts=%d\n",
                    rank,
                    prev_active + 1,
-                   prev_phase);
+                   prev_phase,
+                   num_tokens, num_ranks, num_experts);
             printf("*****************************************************************************\n");
         }
     }
@@ -479,6 +483,12 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               num_warp_groups, num_warps_per_group, \
               round_scale, phases, nixl_ctx); } break
 
+    fprintf(stderr,
+            "[STREAM-DBG][NIXL-EP] dispatch launch: rank=%d num_ranks=%d "
+            "num_tokens=%d stream=%p phases=%d\n",
+            rank, num_ranks, num_tokens, (void*)stream, phases);
+    fflush(stderr);
+
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
@@ -677,10 +687,14 @@ combine(void* combined_x,
         const int prev_phase = atomicExch(combine_phase_state, PHASE_STATE_SEND);
         if (prev_active > 0) {
             printf("*****************************************************************************\n");
-            printf("Warning: combine overlap detected on rank %d (active kernels: %d, previous phase state: %d [0=IDLE,1=SEND,2=RECV])\n",
+            printf("Warning: combine overlap detected on rank %d "
+                   "(active kernels: %d, previous phase state: %d "
+                   "[0=IDLE,1=SEND,2=RECV]) "
+                   "num_combined_tokens=%d num_ranks=%d num_experts=%d\n",
                    rank,
                    prev_active + 1,
-                   prev_phase);
+                   prev_phase,
+                   num_combined_tokens, num_ranks, num_experts);
             printf("*****************************************************************************\n");
         }
     }
@@ -1133,6 +1147,12 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
               phases, zero_copy, nixl_ctx); } break
+
+    fprintf(stderr,
+            "[STREAM-DBG][NIXL-EP] combine launch: rank=%d num_ranks=%d "
+            "num_combined_tokens=%d stream=%p phases=%d\n",
+            rank, num_ranks, num_combined_tokens, (void*)stream, phases);
+    fflush(stderr);
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
